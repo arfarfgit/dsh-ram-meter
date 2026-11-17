@@ -1,0 +1,3 @@
+- insert:
+    - id: ram-meter
+      name: '@npmghost/dsh-ram-meter'

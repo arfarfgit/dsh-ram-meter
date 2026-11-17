@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "RAM meter",
+    "description": "Shows the harness host's live resident memory against its measured V8 heap ceiling as a compact pill in the sidebar footer. Adds GET /dsh-ram to the host, so the ceiling is read from the running process rather than assumed."
+  }
+}
