@@ -1,8 +1,25 @@
 {
   "format": 1,
-  "title": "npmghost plugins",
-  "description": "Plugins published by npmghost for DeepSeek Harness.",
-  "metadata": {},
+  "title": {
+    "en": "npmghost plugins",
+    "zh": "npmghost 插件"
+  },
+  "description": {
+    "en": "Plugins published by npmghost for DeepSeek Harness.",
+    "zh": "npmghost 为 DeepSeek Harness 发布的插件。"
+  },
+  "metadata": {
+    "categories": {
+      "monitoring": {
+        "title": {
+          "en": "Monitoring & Performance",
+          "zh": "监控与性能"
+        }
+      }
+    },
+    "labels": {},
+    "sortKeys": {}
+  },
   "plugins": [
     {
       "name": "@npmghost/dsh-ram-meter",
