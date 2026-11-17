@@ -23,6 +23,8 @@ import type { MeterState, MeterStore } from './store'
 export interface ReactApi {
   createElement(type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]): unknown
   useSyncExternalStore<T>(subscribe: (onChange: () => void) => () => void, getSnapshot: () => T): T
+  useState<S>(initial: S): [S, (next: S) => void]
+  useRef<T>(initial: T): { current: T }
 }
 
 export interface PillProps {
@@ -77,6 +79,8 @@ export function createPill(React: ReactApi) {
   return function RamMeterPill(props: PillProps): unknown {
     const { placement, store, labels } = props
     const state = React.useSyncExternalStore<MeterState>(store.subscribe, store.getSnapshot)
+    const [hovered, setHovered] = React.useState(false)
+    const appliedTitle = React.useRef<string | null>(null)
 
     // Every placement stays registered so a configuration change needs no re-registration; only the
     // configured one renders, the others return nothing.
@@ -88,7 +92,14 @@ export function createPill(React: ReactApi) {
     const tone = toneFor(percentage)
     const color = TONE_COLORS[tone]
 
-    const title = sample ? buildTooltip(sample, labels) : labels.unavailable
+    // The native tooltip is dismissed by the browser whenever its `title` changes. A changing
+    // attribute therefore has to be avoided, not just made less frequent: the hover pause stops the
+    // poll, and this freeze keeps the text from the moment the pointer arrived, so even a stray
+    // re-render (a configuration refresh) re-applies the identical string instead of a new one.
+    const liveTitle = sample ? buildTooltip(sample, labels) : labels.unavailable
+    if (!hovered) appliedTitle.current = liveTitle
+    const title = appliedTitle.current ?? liveTitle
+
     const label = sample ? pillSummary(sample, labels) : labels.unavailable
     const value = sample ? formatGigabytes(sample.rss) : UNAVAILABLE
     const percentText = sample ? formatPercent(percentage) : UNAVAILABLE
@@ -107,6 +118,15 @@ export function createPill(React: ReactApi) {
       role: 'status',
       'aria-label': label,
       title,
+      // Reading the tooltip must not race the poll: hover stops it, leaving starts it again.
+      onPointerEnter: () => {
+        setHovered(true)
+        store.pause()
+      },
+      onPointerLeave: () => {
+        setHovered(false)
+        store.resume()
+      },
       style: {
         boxSizing: 'border-box',
         minWidth: 0,

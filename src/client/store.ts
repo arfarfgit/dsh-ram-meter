@@ -30,6 +30,13 @@ export interface MeterStore {
   start(): void
   /** Stop polling and abort any in-flight read; idempotent. */
   stop(): void
+  /**
+   * Suspend refreshes. The pill calls this while the pointer rests on it, so the rendered text (and
+   * with it the native tooltip) stops changing under the cursor; idempotent.
+   */
+  pause(): void
+  /** Resume after {@link pause}: reads once immediately, then follows the configured cadence. */
+  resume(): void
 }
 
 export interface MeterStoreOptions {
@@ -66,9 +73,26 @@ export function createMeterStore(options: MeterStoreOptions = {}): MeterStore {
     config: { refreshIntervalMs: DEFAULT_REFRESH_INTERVAL_MS, placement: DEFAULT_PLACEMENT },
   }
   let running = false
+  let paused = false
+  /**
+   * Bumped whenever work is abandoned (pause, stop). A read that started under an older epoch is
+   * discarded instead of publishing: an aborted fetch must not flip the pill to "—" mid-hover.
+   */
+  let epoch = 0
   let statsTimer: ReturnType<typeof setTimeout> | undefined
   let configTimer: ReturnType<typeof setTimeout> | undefined
   let controller: AbortController | undefined
+
+  function clearTimers(): void {
+    if (statsTimer !== undefined) clearTimeout(statsTimer)
+    if (configTimer !== undefined) clearTimeout(configTimer)
+    statsTimer = undefined
+    configTimer = undefined
+  }
+
+  function isCurrent(startedAt: number): boolean {
+    return running && !paused && startedAt === epoch
+  }
 
   function publish(next: MeterState): void {
     const previous = state
@@ -95,24 +119,29 @@ export function createMeterStore(options: MeterStoreOptions = {}): MeterStore {
     return response.json()
   }
 
-  function scheduleStats(): void {
-    if (!running || statsTimer !== undefined) return
+  function scheduleStats(delayMs = state.config.refreshIntervalMs): void {
+    if (!running || paused || statsTimer !== undefined) return
     statsTimer = setTimeout(async () => {
       statsTimer = undefined
+      const startedAt = epoch
       try {
         const sample = asHeapSample(await readJson(STATS_PATH))
         if (sample === undefined) throw new Error('malformed sample')
+        if (!isCurrent(startedAt)) return
         publish({ ...state, sample, unreachable: false })
       } catch {
+        if (!isCurrent(startedAt)) return
         publish({ ...state, sample: null, unreachable: true })
       }
       scheduleStats()
-    }, state.config.refreshIntervalMs)
+    }, delayMs)
   }
 
   async function refreshConfig(): Promise<void> {
+    const startedAt = epoch
     try {
       const resolved = resolveMeterConfig(await readJson(CONFIG_PATH))
+      if (!isCurrent(startedAt)) return
       if (!sameConfig(state.config, resolved)) {
         const previousInterval = state.config.refreshIntervalMs
         publish({ ...state, config: resolved })
@@ -128,7 +157,7 @@ export function createMeterStore(options: MeterStoreOptions = {}): MeterStore {
   }
 
   function scheduleConfig(): void {
-    if (!running || configTimer !== undefined) return
+    if (!running || paused || configTimer !== undefined) return
     configTimer = setTimeout(() => {
       configTimer = undefined
       void refreshConfig().then(() => scheduleConfig())
@@ -152,12 +181,26 @@ export function createMeterStore(options: MeterStoreOptions = {}): MeterStore {
     },
     stop() {
       running = false
-      if (statsTimer !== undefined) clearTimeout(statsTimer)
-      if (configTimer !== undefined) clearTimeout(configTimer)
-      statsTimer = undefined
-      configTimer = undefined
+      paused = false
+      epoch += 1
+      clearTimers()
       controller?.abort()
       controller = undefined
+    },
+    pause() {
+      if (!running || paused) return
+      paused = true
+      epoch += 1
+      clearTimers()
+      controller?.abort()
+      controller = undefined
+    },
+    resume() {
+      if (!running || !paused) return
+      paused = false
+      // Read straight away so the value is fresh the moment the pointer leaves, then keep cadence.
+      scheduleStats(0)
+      scheduleConfig()
     },
   }
 }

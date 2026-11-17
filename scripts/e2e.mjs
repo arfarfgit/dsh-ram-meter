@@ -144,6 +144,7 @@ async function startEdge(userDataDir) {
 function connectCdp(webSocketDebuggerUrl) {
   const socket = new WebSocket(webSocketDebuggerUrl)
   const pending = new Map()
+  const listeners = new Map()
   let nextId = 1
   const ready = new Promise((resolve, reject) => {
     socket.addEventListener('open', () => resolve())
@@ -151,7 +152,14 @@ function connectCdp(webSocketDebuggerUrl) {
   })
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(String(event.data))
-    if (message.id === undefined) return
+    if (message.id === undefined) {
+      for (const listener of listeners.get(message.method) ?? []) {
+        try {
+          listener(message.params)
+        } catch {}
+      }
+      return
+    }
     const entry = pending.get(message.id)
     if (entry === undefined) return
     pending.delete(message.id)
@@ -166,6 +174,12 @@ function connectCdp(webSocketDebuggerUrl) {
       const result = new Promise((resolve, reject) => pending.set(id, { resolve, reject }))
       socket.send(JSON.stringify({ id, method, params }))
       return result
+    },
+    /** Subscribe to one CDP event method. */
+    on(method, listener) {
+      const list = listeners.get(method) ?? []
+      list.push(listener)
+      listeners.set(method, list)
     },
     close() {
       socket.close()
@@ -229,6 +243,11 @@ async function main() {
     cdp = connectCdp(target.webSocketDebuggerUrl)
     await cdp.send('Page.enable')
     await cdp.send('Runtime.enable')
+    await cdp.send('Network.enable')
+    const statsReads = []
+    cdp.on('Network.requestWillBeSent', (params) => {
+      if (String(params?.request?.url ?? '').includes('/dsh-ram')) statsReads.push(params.request.url)
+    })
 
     // `conversation.composer.dock` is a session-scoped slot: the composer only renders it once a
     // conversation exists, so open one before looking for the pill. A fresh profile has no
@@ -324,6 +343,102 @@ async function main() {
     evidence.samples = { first, second }
     log(`rss changed between samples: ${first} -> ${second}`)
     evidence.steps.push({ name: 'value changes between two samples', ok: true })
+
+    // Regression check for the tooltip flicker: while the pointer rests on the pill the poll must
+    // stop, so neither the displayed value nor the `title` text may change, and no /dsh-ram request
+    // may happen. Leaving must restart the poll without a reload.
+    const mouseTo = async (point) => cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: point.x,
+      y: point.y,
+      button: 'none',
+      buttons: 0,
+    })
+    const readPill = () => evaluate(cdp, `(() => {
+      const pill = ${PILL_QUERY}
+      if (pill === null) return null
+      return { rss: pill.dataset.ramRss, title: pill.getAttribute('title'), text: pill.textContent }
+    })()`)
+    const pillCentre = await evaluate(cdp, `(() => {
+      const rect = ${PILL_QUERY}.getBoundingClientRect()
+      return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
+    })()`)
+    const away = { x: 4, y: 4 }
+
+    // A first-run modal (the preview notice) owns a full-window backdrop, so the pointer never
+    // reaches the pill under it. Dismiss it before the hover check.
+    const dismissed = await evaluate(cdp, `(() => {
+      const button = [...document.querySelectorAll('button')].find((candidate) => /^(continue|got it|ok|dismiss)$/i.test((candidate.textContent ?? '').trim()))
+      if (button === undefined) return false
+      button.click()
+      return true
+    })()`)
+    if (dismissed) {
+      log('dismissed the first-run notice')
+      await delay(700)
+    }
+    // Some first-run surfaces also close on Escape; harmless when nothing is open.
+    for (const type of ['keyDown', 'keyUp']) {
+      await cdp.send('Input.dispatchKeyEvent', { type, key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 })
+    }
+    await delay(400)
+
+    await mouseTo(away)
+    await delay(200)
+    const readsBeforeHover = statsReads.length
+    await mouseTo(pillCentre)
+    await delay(400)
+    const hoverProbe = await evaluate(cdp, `(() => {
+      const pill = ${PILL_QUERY}
+      const rect = pill.getBoundingClientRect()
+      const atPoint = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+      return {
+        hovered: pill.matches(':hover'),
+        reachedPill: atPoint !== null && atPoint.closest('[data-dsh-ram-meter]') !== null,
+        atPoint: atPoint === null ? null : atPoint.tagName + '.' + String(atPoint.className).slice(0, 60),
+        masks: [...document.querySelectorAll('[class*="_mask_"]')].map((element) => {
+          const rect = element.getBoundingClientRect()
+          return {
+            cls: String(element.className).slice(0, 40),
+            box: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
+            pointerEvents: getComputedStyle(element).pointerEvents,
+          }
+        }),
+        dialogs: [...document.querySelectorAll('[role="dialog"]')].map((element) => (element.textContent ?? '').slice(0, 40)),
+      }
+    })()`)
+    evidence.hoverProbe = hoverProbe
+    if (!hoverProbe.hovered) throw new Error(`pointer never entered the pill: ${JSON.stringify(hoverProbe)}`)
+    const hoverStart = await readPill()
+    const hoverSamples = []
+    for (let index = 0; index < 10; index += 1) {
+      await delay(500)
+      hoverSamples.push(await readPill())
+    }
+    const readsWhileHovering = statsReads.length - readsBeforeHover
+    evidence.hover = { start: hoverStart, samples: hoverSamples, statsReadsWhileHovering: readsWhileHovering }
+
+    for (const [index, hoverSample] of hoverSamples.entries()) {
+      if (hoverSample === null) throw new Error(`pill disappeared while hovering (sample ${index})`)
+      if (hoverSample.title !== hoverStart.title) {
+        throw new Error(`tooltip text changed while hovering: ${JSON.stringify({ from: hoverStart.title, to: hoverSample.title })}`)
+      }
+      if (hoverSample.rss !== hoverStart.rss) {
+        throw new Error(`displayed value changed while hovering: ${hoverStart.rss} -> ${hoverSample.rss}`)
+      }
+      if (hoverSample.text !== hoverStart.text) throw new Error('pill text changed while hovering')
+    }
+    if (readsWhileHovering !== 0) throw new Error(`polling continued while hovering (${readsWhileHovering} /dsh-ram reads)`)
+    evidence.steps.push({ name: 'tooltip and value frozen for 5 s of hover, no polling', ok: true })
+    log(`hover: ${hoverSamples.length} samples over 5 s identical, ${readsWhileHovering} polls`)
+
+    await mouseTo(away)
+    const readsBeforeLeave = statsReads.length
+    await waitFor('resumed polling', async () => statsReads.length, (count) => count > readsBeforeLeave, 15_000)
+    const resumed = await readPill()
+    evidence.hover.resumedRss = resumed?.rss ?? ''
+    evidence.steps.push({ name: 'polling resumes after the pointer leaves', ok: true })
+    log(`hover ended: polling resumed (${statsReads.length - readsBeforeLeave} reads), value ${resumed?.rss}`)
 
     const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const screenshotPath = join(outDir, `pill-${placement}.png`)

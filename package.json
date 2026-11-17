@@ -1,6 +1,6 @@
 {
   "name": "@npmghost/dsh-ram-meter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Live host memory and heap-ceiling meter for DeepSeek Harness.",
   "keywords": [
     "dsh-plugin",

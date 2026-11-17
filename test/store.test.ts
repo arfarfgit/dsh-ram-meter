@@ -49,6 +49,11 @@ function storeWith(fetcher: FakeFetcher) {
   return createMeterStore({ fetcher: fetcher as unknown as typeof fetch })
 }
 
+/** How many times the stats route was read. */
+function statsReads(fetcher: FakeFetcher): number {
+  return fetcher.mock.calls.filter(call => String(call[0]) === '/dsh-ram').length
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
 })
@@ -160,6 +165,93 @@ describe('polling store', () => {
     await vi.advanceTimersByTimeAsync(60_000)
 
     expect(fetcher.mock.calls.length).toBe(before)
+  })
+})
+
+describe('hover pause', () => {
+  it('suspends polling between pause() and resume(), then resumes with a fresh read', async () => {
+    const fetcher = fetcherFor({ stats: () => ok(LIVE) })
+    const store = storeWith(fetcher)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(statsReads(fetcher)).toBe(1)
+
+    store.pause()
+    // Ten intervals of hovering: no request, and the rendered value cannot change.
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(statsReads(fetcher)).toBe(1)
+    expect(store.getSnapshot().sample).toEqual(LIVE)
+
+    store.resume()
+    // Resuming reads immediately so the value is fresh as soon as the pointer leaves...
+    await vi.advanceTimersByTimeAsync(0)
+    expect(statsReads(fetcher)).toBe(2)
+
+    // ...and then keeps the configured cadence.
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(statsReads(fetcher)).toBe(3)
+
+    store.stop()
+  })
+
+  it('drops a read that was in flight when the pointer arrived', async () => {
+    let release: (value: FakeResponse) => void = () => {}
+    const pending = new Promise<FakeResponse>((resolve) => {
+      release = resolve
+    })
+    const fetcher = fetcherFor({ stats: () => pending })
+    const store = storeWith(fetcher)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(store.getSnapshot().sample).toBeNull()
+
+    store.pause()
+    release(ok(LIVE))
+    await vi.advanceTimersByTimeAsync(0)
+    await Promise.resolve()
+
+    // The aborted read must not publish: no value appears under the cursor, and no false "—".
+    expect(store.getSnapshot().sample).toBeNull()
+    expect(store.getSnapshot().unreachable).toBe(false)
+
+    store.stop()
+  })
+
+  it('keeps the failure state frozen while paused', async () => {
+    const fetcher = fetcherFor({ stats: () => fail(503) })
+    const store = storeWith(fetcher)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(store.getSnapshot().unreachable).toBe(true)
+
+    store.pause()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(store.getSnapshot().unreachable).toBe(true)
+    expect(store.getSnapshot().sample).toBeNull()
+    store.stop()
+  })
+
+  it('ignores a repeated pause and a resume without a pause', async () => {
+    const fetcher = fetcherFor({ stats: () => ok(LIVE) })
+    const store = storeWith(fetcher)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(2000)
+
+    store.resume()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(statsReads(fetcher)).toBe(2)
+
+    store.pause()
+    store.pause()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(statsReads(fetcher)).toBe(2)
+
+    store.stop()
   })
 })
 

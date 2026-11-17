@@ -23,6 +23,8 @@ Heap 0.40 GB / 0.60 GB
 PID 4242 · uptime 1h 2m
 ```
 
+- **Hover pauses the meter**: while the pointer rests on the pill no refresh runs, so the number and
+  the tooltip hold still while you read them. The next sample lands as soon as the pointer leaves.
 - **Colours**: neutral below 50%, amber from 50% to 75%, red above 75%.
 - **Failure**: when the route cannot be read the pill shows `—` and retries on the next tick. It never
   throws and never writes to the browser console.
@@ -36,7 +38,7 @@ dsh plugin --profile <name> add @npmghost/dsh-ram-meter
 Or, from a packed tarball, inside the profile directory:
 
 ```sh
-pnpm add ./npmghost-dsh-ram-meter-0.1.0.tgz
+pnpm add ./npmghost-dsh-ram-meter-0.1.1.tgz
 ```
 
 Then add the bundle to the profile's `dsh.profile.bundles` list — Plugin Manager's **Add plugin**
@@ -110,3 +112,4 @@ package name, and its only module request is `react`.
 ## License
 
 MIT © npmghost
+
