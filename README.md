@@ -8,7 +8,7 @@ assuming one: a stock host reports its ~4 GB V8 limit, a host launched with
 `--max-old-space-size=16384` reports ~16 GB, and the pill shows whichever number the running process
 actually has.
 
-![RAM meter pill in the sidebar footer, reading 4.64 GB · 29% against a 16 GB ceiling](ram_meter.png)
+![Four RAM meter states: 0.67 GB · 16% against the stock host's 4.1 GB ceiling, then 2.9 GB · 18%, 4.64 GB · 29%, and 8.53 GB · 53% (amber) against a 16 GB ceiling](ram_meter.png)
 
 ```
 RAM 1.4 GB · 9%
