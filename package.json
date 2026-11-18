@@ -1,6 +1,7 @@
 {
   "name": "@npmghost/dsh-ram-meter",
-  "version": "0.1.1",
+  "version": "0.1.2",
+  "icon": "./assets/icon-180.png",
   "description": "Live host memory and heap-ceiling meter for DeepSeek Harness.",
   "keywords": [
     "dsh-plugin",
@@ -52,7 +53,8 @@
     "README.md",
     "LICENSE",
     "locale",
-    "icon.svg"
+    "icon.svg",
+    "assets"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",

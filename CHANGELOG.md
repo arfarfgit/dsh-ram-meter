@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+Adds a storefront icon to the package.
+
+- `package.json` now declares `icon: ./assets/icon-180.png`, the same 180x180 raster tile used by
+  the community catalogue entry, and ships it in `files`. Plugin listings that read the package
+  icon no longer fall back to a generic avatar or an unrenderable SVG.
+- No code, route or behaviour change.
+
 ## 0.1.1
 
 Fixes the flickering native tooltip.
