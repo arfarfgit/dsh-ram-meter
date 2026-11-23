@@ -3,10 +3,12 @@ import {
   EN_LABELS,
   asHeapSample,
   buildTooltip,
+  describeShare,
   formatCeiling,
   formatGigabytes,
   formatPercent,
   formatUptime,
+  isOverCeiling,
   percentageOf,
   pillSummary,
   toneFor,
@@ -90,6 +92,34 @@ describe('colour threshold', () => {
   it('falls back to neutral for a non-finite value', () => {
     expect(toneFor(Number.NaN)).toBe('neutral')
   })
+
+  it('is red whenever the sample is over the ceiling, whatever the clamped percentage says', () => {
+    expect(toneFor(100, true)).toBe('red')
+    expect(toneFor(40, true)).toBe('red')
+  })
+})
+
+describe('above the ceiling', () => {
+  it('detects a resident set larger than the heap ceiling', () => {
+    expect(isOverCeiling(sample({ rss: 20 * GIB }))).toBe(true)
+    expect(isOverCeiling(sample({ rss: 16 * GIB }))).toBe(false)
+    expect(isOverCeiling(sample({ rss: 15 * GIB }))).toBe(false)
+  })
+
+  it('never reports over-ceiling for an unusable limit', () => {
+    expect(isOverCeiling(sample({ rss: 20 * GIB, heapLimit: 0 }))).toBe(false)
+    expect(isOverCeiling(sample({ rss: 20 * GIB, heapLimit: Number.NaN }))).toBe(false)
+  })
+
+  it('says so in the tooltip instead of a bare 100%', () => {
+    const over = sample({ rss: 20 * GIB })
+    const share = describeShare(over)
+    expect(share).toBe('RSS 20.0 GB is above the 16 GB V8 heap ceiling (clamped to 100%)')
+    const tooltip = buildTooltip(over)
+    expect(tooltip.split('\n')[0]).toBe(share)
+    expect(tooltip).toContain('clamped')
+    expect(tooltip).not.toMatch(/\(100\.0%\)/)
+  })
 })
 
 describe('uptime', () => {
@@ -103,22 +133,26 @@ describe('uptime', () => {
 })
 
 describe('text built from a sample', () => {
-  it('summarises the pill in one line', () => {
-    expect(pillSummary(sample())).toBe('RAM 1.4 GB · 9%')
+  it('states that the percentage is RSS against the V8 heap ceiling', () => {
+    expect(describeShare(sample())).toBe('RSS 1.4 GB · 8.8% of the 16 GB V8 heap ceiling')
   })
 
-  it('lists heap used/total, pid, uptime and the measured ceiling in the tooltip', () => {
+  it('summarises the pill with the product name and the same sentence', () => {
+    expect(pillSummary(sample())).toBe('RAM meter: RSS 1.4 GB · 8.8% of the 16 GB V8 heap ceiling')
+  })
+
+  it('lists the share, heap used/total, pid and uptime in the tooltip', () => {
     const tooltip = buildTooltip(sample())
     const lines = tooltip.split('\n')
     expect(lines).toHaveLength(3)
-    expect(lines[0]).toBe('RAM 1.4 GB of 16 GB ceiling (8.8%)')
+    expect(lines[0]).toBe('RSS 1.4 GB · 8.8% of the 16 GB V8 heap ceiling')
     expect(lines[1]).toBe('Heap 0.40 GB / 0.60 GB')
     expect(lines[2]).toBe('PID 4242 · uptime 1h 2m')
   })
 
   it('uses the localised labels it is given', () => {
-    const labels = { ...EN_LABELS, ram: 'Memory', pid: 'Prozess-ID', uptime: 'Laufzeit' }
-    expect(pillSummary(sample(), labels)).toContain('Memory 1.4 GB')
+    const labels = { ...EN_LABELS, rss: 'Memory', pid: 'Prozess-ID', uptime: 'Laufzeit' }
+    expect(describeShare(sample(), labels)).toContain('Memory 1.4 GB')
     expect(buildTooltip(sample(), labels)).toContain('Prozess-ID 4242 · Laufzeit 1h 2m')
   })
 })

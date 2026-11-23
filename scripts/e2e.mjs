@@ -2,10 +2,12 @@
 /**
  * End-to-end check for the packed plugin, driven through Edge's DevTools protocol.
  *
- * It boots a real DSH host for the given profile, opens the authenticated page in headless Edge,
- * and asserts what a user sees: the pill is in the DOM, it is in the slot the configuration chose,
- * its value changes between two samples, and its native tooltip carries the measured ceiling,
- * heap, PID and uptime. It also saves a screenshot per run.
+ * It boots a real DSH host for the given profile, mints the page credential the host now requires,
+ * asserts the route protocol (401 without it, GET/HEAD/POST with it), opens the authenticated page in
+ * headless Edge, and asserts what a user sees: the pill is in the DOM, it is in the slot the
+ * configuration chose, its value changes between two samples, its tooltip carries the measured
+ * ceiling/heap/PID/uptime, and a hover freezes both the value and the tooltip. It also saves a
+ * screenshot per run.
  *
  * Usage (no absolute path is baked in; every path is an argument or an environment variable):
  *   node scripts/e2e.mjs --cli <dsh-desktop-host/lib/cli.js> --node <node.exe> --home <DSH_HOME> \
@@ -225,13 +227,85 @@ async function main() {
     const pageUrl = await host.url
     log(`host page ${pageUrl.replace(/token=[^&]+/, 'token=<redacted>')}`)
 
-    const hostPort = Number(/127\.0\.0\.1:(\d+)/.exec(pageUrl)[1])
-    const ram = await fetch(`http://127.0.0.1:${hostPort}/dsh-ram`).then((response) => {
-      if (!response.ok) throw new Error(`/dsh-ram answered ${response.status}`)
-      return response.json()
-    })
+    // --- Credential -------------------------------------------------------------------------
+    // Since 0.1.3 both routes sit behind the same fence as /api, so a bare fetch is 401. Mint the
+    // browser cookie exactly as the page does: one hit on the token URL, which answers 303 with a
+    // signed, authority-bound cookie. Its name belongs to the host — read it, never hardcode it.
+    const origin = new URL(pageUrl).origin
+    const tokenResponse = await fetch(pageUrl, { redirect: 'manual' })
+    const setCookieHeader = typeof tokenResponse.headers.getSetCookie === 'function'
+      ? tokenResponse.headers.getSetCookie()[0]
+      : tokenResponse.headers.get('set-cookie') ?? undefined
+    if (tokenResponse.status !== 303 || setCookieHeader === undefined) {
+      throw new Error(`the token URL answered ${tokenResponse.status} without a cookie`)
+    }
+    const credential = setCookieHeader.split(';')[0]
+    const credentialName = credential.split('=')[0]
+    if (credentialName === undefined || credentialName === '') throw new Error('the set-cookie has no name')
+    log(`minted the page credential (${credentialName})`)
+
+    // --- Route protocol ---------------------------------------------------------------------
+    // 1. No credential: refused, and the body must not leak a memory number.
+    const anonymous = await fetch(`${origin}/dsh-ram`)
+    const anonymousBody = await anonymous.text()
+    if (anonymous.status !== 401) throw new Error(`unauthenticated GET answered ${anonymous.status}, expected 401`)
+    let anonymousJson = {}
+    try {
+      anonymousJson = JSON.parse(anonymousBody)
+    } catch {
+      anonymousJson = {}
+    }
+    if (Object.prototype.hasOwnProperty.call(anonymousJson, 'rss')) {
+      throw new Error(`unauthenticated body leaks rss: ${anonymousBody}`)
+    }
+    if (anonymousBody.includes('"rss"')) throw new Error(`unauthenticated body mentions rss: ${anonymousBody}`)
+    evidence.steps.push({ name: 'GET without the credential is 401 with no memory numbers', ok: true })
+    log(`GET without credential: ${anonymous.status} ${anonymousBody}`)
+
+    // 2. With the credential: 200 and exactly the six fields.
+    const authorized = await fetch(`${origin}/dsh-ram`, { headers: { cookie: credential } })
+    if (authorized.status !== 200) throw new Error(`credentialed GET answered ${authorized.status}, expected 200`)
+    const ram = await authorized.json()
+    const getLength = authorized.headers.get('content-length')
+    const getBodyBytes = Buffer.byteLength(JSON.stringify(ram))
+    const FIELDS = ['heapLimit', 'heapTotal', 'heapUsed', 'pid', 'rss', 'uptimeSec']
+    if (Object.keys(ram).sort().join(',') !== FIELDS.join(',')) {
+      throw new Error(`credentialed GET returned ${JSON.stringify(Object.keys(ram))}, expected the six fields`)
+    }
+    for (const field of FIELDS) {
+      if (typeof ram[field] !== 'number' || !Number.isFinite(ram[field])) {
+        throw new Error(`credentialed GET returned a non-numeric ${field}: ${JSON.stringify(ram[field])}`)
+      }
+    }
+    if (Number(getLength) !== getBodyBytes) {
+      throw new Error(`GET content-length ${getLength} does not match its ${getBodyBytes}-byte body`)
+    }
     evidence.route = ram
+    evidence.credential = credentialName
+    evidence.steps.push({ name: 'GET with the credential is 200 with the six fields', ok: true })
     log(`route heapLimit ${ram.heapLimit} bytes (${(ram.heapLimit / 1024 ** 3).toFixed(2)} GiB), rss ${ram.rss}, pid ${ram.pid}`)
+
+    // 3. HEAD: same headers as the GET, no body.
+    const head = await fetch(`${origin}/dsh-ram`, { method: 'HEAD', headers: { cookie: credential } })
+    const headBody = await head.text()
+    const headLength = head.headers.get('content-length')
+    if (head.status !== 200) throw new Error(`HEAD answered ${head.status}, expected 200`)
+    if (headBody !== '') throw new Error(`HEAD returned a ${Buffer.byteLength(headBody)}-byte body`)
+    if (headLength !== getLength) throw new Error(`HEAD content-length ${headLength} differs from the GET's ${getLength}`)
+    if (head.headers.get('content-type') !== 'application/json; charset=utf-8') {
+      throw new Error(`HEAD content-type is ${head.headers.get('content-type')}`)
+    }
+    if (head.headers.get('cache-control') !== 'no-store') {
+      throw new Error(`HEAD cache-control is ${head.headers.get('cache-control')}`)
+    }
+    evidence.steps.push({ name: 'HEAD is 200 with the GET content-length and no body', ok: true })
+    log(`HEAD: ${head.status} content-length ${headLength}, empty body`)
+
+    // 4. Other methods stay refused.
+    const post = await fetch(`${origin}/dsh-ram`, { method: 'POST', headers: { cookie: credential } })
+    if (post.status !== 405) throw new Error(`POST answered ${post.status}, expected 405`)
+    evidence.steps.push({ name: 'POST with the credential is 405', ok: true })
+    log(`POST: ${post.status}`)
 
     // A fresh browser profile per run: a stale DevToolsActivePort from an earlier run would point
     // at a port nothing listens on.
@@ -303,6 +377,8 @@ async function main() {
         text: pill.textContent,
         title: pill.getAttribute('title'),
         ariaLabel: pill.getAttribute('aria-label'),
+        role: pill.getAttribute('role'),
+        ariaLive: pill.getAttribute('aria-live'),
         position: getComputedStyle(pill).position,
         parentSlot: pill.closest('[data-slot]')?.getAttribute('data-slot') ?? null,
         slotSeat: pill.parentElement?.getAttribute('data-slot') ?? null,
@@ -312,16 +388,25 @@ async function main() {
     log(`pill rendered: ${JSON.stringify(info.text)} (${info.placement}, ${info.tone})`)
 
     if (info.placement !== placement) throw new Error(`pill rendered in ${info.placement}, expected ${placement}`)
-    // The visible text is a row of spans spaced by flex `gap`, so textContent has no spaces; the
-    // accessible label is the same sentence with its spacing intact.
+
+    // 0.1.3 wording: the value is RSS measured against the V8 heap ceiling. The visible row is a set
+    // of flex-gapped spans, so its textContent carries no spaces — assert the shape, not spacing.
     const compactText = String(info.text).replace(/\s+/g, '')
-    if (!/^RAM\d+\.\d{2}GB·\d+%(\d+GB)?$/.test(compactText)) {
+    if (!/^RSS\d+\.\d{2}GB·\d+%(\d+GB)?$/.test(compactText)) {
       throw new Error(`unexpected pill text: ${JSON.stringify(info.text)}`)
     }
-    if (!/^RAM \d+\.\d{2} GB · \d+%$/.test(String(info.ariaLabel))) {
-      throw new Error(`unexpected accessible label: ${JSON.stringify(info.ariaLabel)}`)
+    const ariaLabel = String(info.ariaLabel)
+    if (!/^RAM meter: RSS \d+\.\d{2} GB · \d+\.\d% of the \d+(?:\.\d)? GB V8 heap ceiling$/.test(ariaLabel)) {
+      throw new Error(`unexpected accessible label: ${JSON.stringify(ariaLabel)}`)
     }
-    for (const needle of ['ceiling', 'Heap', 'PID', 'uptime']) {
+    if (info.role !== 'group') throw new Error(`pill role is ${JSON.stringify(info.role)}, expected "group"`)
+    if (info.ariaLive !== 'off') throw new Error(`pill aria-live is ${JSON.stringify(info.ariaLive)}, expected "off"`)
+
+    const titleLines = String(info.title).split('\n')
+    if (!/^RSS \d+\.\d{2} GB · \d+\.\d% of the \d+(?:\.\d)? GB V8 heap ceiling$/.test(titleLines[0] ?? '')) {
+      throw new Error(`unexpected tooltip share line: ${JSON.stringify(titleLines[0])}`)
+    }
+    for (const needle of ['V8 heap ceiling', 'Heap', 'PID', 'uptime']) {
       if (!String(info.title).includes(needle)) throw new Error(`tooltip is missing ${needle}: ${JSON.stringify(info.title)}`)
     }
     const ceilingGb = Math.round(ram.heapLimit / 1024 ** 3)
@@ -329,6 +414,7 @@ async function main() {
       throw new Error(`tooltip does not name the measured ${ceilingGb} GB ceiling: ${JSON.stringify(info.title)}`)
     }
     evidence.steps.push({ name: 'pill present in configured slot', ok: true })
+    evidence.steps.push({ name: 'pill is a group, aria-live off, RSS/V8-ceiling wording', ok: true })
     evidence.steps.push({ name: 'tooltip carries ceiling, heap, pid, uptime', ok: true })
 
     if (placement === 'floating' && info.position !== 'fixed') {

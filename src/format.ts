@@ -3,6 +3,10 @@
  *
  * Everything here is deterministic and side-effect free so the Unit tests can pin the exact
  * strings the pill renders, and so both halves can share one definition of a sample.
+ *
+ * Wording matters here: the number is the process's resident set size (RSS) and the percentage is
+ * that RSS measured against the V8 heap ceiling — not "RAM used" and not "heap used". Every string
+ * below says so, and a sample above the ceiling is described as such instead of a bare 100%.
  */
 
 export interface HeapSample {
@@ -24,23 +28,35 @@ export const BYTES_PER_GIB = 1024 ** 3
 
 /** Labels the Client localises; the defaults keep these helpers testable on their own. */
 export interface MeterLabels {
-  readonly ram: string
+  /** Short label of the measured value: the resident set. */
+  readonly rss: string
   readonly heap: string
-  readonly of: string
+  /** Connective in `8.8% of the 16 GB V8 heap ceiling`. */
+  readonly shareOf: string
+  /** Name of the denominator, so the reader sees what the percentage is a share of. */
   readonly ceiling: string
   readonly pid: string
   readonly uptime: string
   readonly unavailable: string
+  /** Product name used to open the accessible label. */
+  readonly meter: string
+  /** Connective for the above-ceiling sentence. */
+  readonly isAbove: string
+  /** Explains that the percentage is clamped. */
+  readonly clamped: string
 }
 
 export const EN_LABELS: MeterLabels = {
-  ram: 'RAM',
+  rss: 'RSS',
   heap: 'Heap',
-  of: 'of',
-  ceiling: 'ceiling',
+  shareOf: 'of the',
+  ceiling: 'V8 heap ceiling',
   pid: 'PID',
   uptime: 'uptime',
   unavailable: 'RAM meter unavailable',
+  meter: 'RAM meter',
+  isAbove: 'is above the',
+  clamped: 'clamped to 100%',
 }
 
 /**
@@ -74,15 +90,28 @@ export function percentageOf(rss: number, heapLimit: number): number {
   return Math.min(100, Math.max(0, (rss / heapLimit) * 100))
 }
 
+/**
+ * Whether the resident set has grown past the V8 heap ceiling.
+ * A resident set can exceed the heap ceiling; the pill keeps the clamped percentage but must not
+ * present that as an ordinary 100% reading.
+ * @param sample - the latest host sample.
+ * @returns true when `rss` is strictly greater than a usable `heapLimit`.
+ */
+export function isOverCeiling(sample: HeapSample): boolean {
+  return Number.isFinite(sample.heapLimit) && sample.heapLimit > 0 && sample.rss > sample.heapLimit
+}
+
 /** Colour band of the pill: neutral below 50%, amber from 50% to 75%, red above 75%. */
 export type MeterTone = 'neutral' | 'amber' | 'red'
 
 /**
  * Pick the colour band for a percentage.
  * @param percentage - a value from {@link percentageOf}.
- * @returns `neutral` (<50), `amber` (50..75 inclusive), `red` (>75).
+ * @param overCeiling - a sample above the ceiling is always red, whatever the clamped value says.
+ * @returns `neutral` (<50), `amber` (50..75 inclusive), `red` (>75 or over the ceiling).
  */
-export function toneFor(percentage: number): MeterTone {
+export function toneFor(percentage: number, overCeiling = false): MeterTone {
+  if (overCeiling) return 'red'
   if (!Number.isFinite(percentage) || percentage < 50) return 'neutral'
   if (percentage <= 75) return 'amber'
   return 'red'
@@ -121,26 +150,40 @@ export function formatUptime(seconds: number): string {
 }
 
 /**
- * One-line summary used for the pill's accessible label and by the End-to-end test.
+ * One sentence describing the share of the ceiling, used by the pill summary and the tooltip.
  * @param sample - the latest host sample.
  * @param labels - localised labels; English by default.
- * @returns e.g. `RAM 1.4 GB · 9%`.
+ * @returns e.g. `RSS 1.4 GB · 8.8% of the 16 GB V8 heap ceiling`.
  */
-export function pillSummary(sample: HeapSample, labels: MeterLabels = EN_LABELS): string {
+export function describeShare(sample: HeapSample, labels: MeterLabels = EN_LABELS): string {
+  const gigabytes = formatGigabytes(sample.rss)
+  const ceiling = formatCeiling(sample.heapLimit)
+  if (isOverCeiling(sample)) {
+    return `${labels.rss} ${gigabytes} ${labels.isAbove} ${ceiling} ${labels.ceiling} (${labels.clamped})`
+  }
   const percentage = percentageOf(sample.rss, sample.heapLimit)
-  return `${labels.ram} ${formatGigabytes(sample.rss)} · ${formatPercent(percentage)}`
+  return `${labels.rss} ${gigabytes} · ${percentage.toFixed(1)}% ${labels.shareOf} ${ceiling} ${labels.ceiling}`
 }
 
 /**
- * The native tooltip: heap used/total, PID, uptime, and the measured ceiling.
+ * Accessible label for the pill: the product name plus the same sentence the tooltip uses.
  * @param sample - the latest host sample.
  * @param labels - localised labels; English by default.
- * @returns three newline-separated lines.
+ * @returns e.g. `RAM meter: RSS 1.4 GB · 8.8% of the 16 GB V8 heap ceiling`.
+ */
+export function pillSummary(sample: HeapSample, labels: MeterLabels = EN_LABELS): string {
+  return `${labels.meter}: ${describeShare(sample, labels)}`
+}
+
+/**
+ * The native tooltip: the share of the ceiling, heap used/total, PID and uptime.
+ * @param sample - the latest host sample.
+ * @param labels - localised labels; English by default.
+ * @returns three newline-separated lines; an above-ceiling sample says so instead of a bare 100%.
  */
 export function buildTooltip(sample: HeapSample, labels: MeterLabels = EN_LABELS): string {
-  const percentage = percentageOf(sample.rss, sample.heapLimit)
   return [
-    `${labels.ram} ${formatGigabytes(sample.rss)} ${labels.of} ${formatCeiling(sample.heapLimit)} ${labels.ceiling} (${percentage.toFixed(1)}%)`,
+    describeShare(sample, labels),
     `${labels.heap} ${formatGigabytes(sample.heapUsed)} / ${formatGigabytes(sample.heapTotal)}`,
     `${labels.pid} ${sample.pid} · ${labels.uptime} ${formatUptime(sample.uptimeSec)}`,
   ].join('\n')
@@ -168,3 +211,4 @@ export function asHeapSample(value: unknown): HeapSample | undefined {
   if (heapLimit === undefined || uptimeSec === undefined || pid === undefined) return undefined
   return { rss, heapUsed, heapTotal, heapLimit, uptimeSec, pid }
 }
+

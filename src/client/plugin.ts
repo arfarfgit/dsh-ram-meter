@@ -58,13 +58,16 @@ export function registerPill(ctx: ClientContext, options: RegisterOptions): void
     return typeof value === 'string' && value !== '' ? value : EN_LABELS[key]
   }
   const labels: MeterLabels = {
-    ram: read('ram'),
+    rss: read('rss'),
     heap: read('heap'),
-    of: read('of'),
+    shareOf: read('shareOf'),
     ceiling: read('ceiling'),
     pid: read('pid'),
     uptime: read('uptime'),
     unavailable: read('unavailable'),
+    meter: read('meter'),
+    isAbove: read('isAbove'),
+    clamped: read('clamped'),
   }
 
   const store = options.store ?? createMeterStore()
@@ -99,3 +102,4 @@ export function createPlugin(requireModule: (module: string) => unknown) {
     },
   }
 }
+

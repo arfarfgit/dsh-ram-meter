@@ -4,6 +4,11 @@
  * React arrives as an argument instead of an import: the Client bundle is a factory registered in
  * `window.__ModuleLoader__`, and `react` is answered by the shell's static module table at require
  * time. Keeping the component in a factory function also keeps this module free of runtime imports.
+ *
+ * Tooltip rules: the native tooltip is dismissed by the browser whenever its `title` changes, so
+ * the title must not change while it is open. Hovering pauses the poll (store reason "hover") and
+ * freezes the text at pointerenter in state; nothing here writes a ref during render, because a
+ * discarded render must not advance a value a later committed view could display.
  */
 import type { Placement } from '../config'
 import {
@@ -12,6 +17,7 @@ import {
   formatCeiling,
   formatGigabytes,
   formatPercent,
+  isOverCeiling,
   percentageOf,
   pillSummary,
   toneFor,
@@ -25,6 +31,7 @@ export interface ReactApi {
   useSyncExternalStore<T>(subscribe: (onChange: () => void) => () => void, getSnapshot: () => T): T
   useState<S>(initial: S): [S, (next: S) => void]
   useRef<T>(initial: T): { current: T }
+  useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void
 }
 
 export interface PillProps {
@@ -79,26 +86,42 @@ export function createPill(React: ReactApi) {
   return function RamMeterPill(props: PillProps): unknown {
     const { placement, store, labels } = props
     const state = React.useSyncExternalStore<MeterState>(store.subscribe, store.getSnapshot)
+    const active = state.config.placement === placement
     const [hovered, setHovered] = React.useState(false)
-    const appliedTitle = React.useRef<string | null>(null)
+    const [frozenTitle, setFrozenTitle] = React.useState<string | null>(null)
+    const holdsHover = React.useRef(false)
+
+    const releaseHover = (): void => {
+      if (!holdsHover.current) return
+      holdsHover.current = false
+      store.resume('hover')
+    }
+
+    // A pill removed while hovered never receives pointerleave: release the reason on unmount.
+    React.useEffect(() => () => {
+      releaseHover()
+    }, [])
+    // A configuration change moves the pill to another seat; the old seat stops rendering and must
+    // not keep holding the hover reason.
+    React.useEffect(() => {
+      if (!active) releaseHover()
+    }, [active])
 
     // Every placement stays registered so a configuration change needs no re-registration; only the
     // configured one renders, the others return nothing.
-    if (state.config.placement !== placement) return null
+    if (!active) return null
 
     const { compact, container } = styleFor(placement, props.wide)
     const sample = state.sample
     const percentage = sample ? percentageOf(sample.rss, sample.heapLimit) : 0
-    const tone = toneFor(percentage)
+    const overCeiling = sample !== null && isOverCeiling(sample)
+    const tone = toneFor(percentage, overCeiling)
     const color = TONE_COLORS[tone]
 
-    // The native tooltip is dismissed by the browser whenever its `title` changes. A changing
-    // attribute therefore has to be avoided, not just made less frequent: the hover pause stops the
-    // poll, and this freeze keeps the text from the moment the pointer arrived, so even a stray
-    // re-render (a configuration refresh) re-applies the identical string instead of a new one.
+    // The committed tooltip text for this sample. While hovered the frozen copy is what renders, so
+    // a stray re-render re-applies the identical string and the open tooltip is not dismissed.
     const liveTitle = sample ? buildTooltip(sample, labels) : labels.unavailable
-    if (!hovered) appliedTitle.current = liveTitle
-    const title = appliedTitle.current ?? liveTitle
+    const title = hovered && frozenTitle !== null ? frozenTitle : liveTitle
 
     const label = sample ? pillSummary(sample, labels) : labels.unavailable
     const value = sample ? formatGigabytes(sample.rss) : UNAVAILABLE
@@ -115,17 +138,26 @@ export function createPill(React: ReactApi) {
       'data-ram-rss': sample ? String(sample.rss) : '',
       'data-ram-pct': sample ? percentage.toFixed(1) : '',
       'data-ram-tone': sample ? tone : 'neutral',
-      role: 'status',
+      'data-ram-over-ceiling': overCeiling ? 'true' : 'false',
+      // A named group whose label is read on demand: `status` would announce the new value every
+      // refresh, which is noise for a meter that changes every two seconds.
+      role: 'group',
+      'aria-live': 'off',
       'aria-label': label,
       title,
       // Reading the tooltip must not race the poll: hover stops it, leaving starts it again.
       onPointerEnter: () => {
+        if (!holdsHover.current) {
+          holdsHover.current = true
+          store.pause('hover')
+        }
+        setFrozenTitle(liveTitle)
         setHovered(true)
-        store.pause()
       },
       onPointerLeave: () => {
+        releaseHover()
+        setFrozenTitle(null)
         setHovered(false)
-        store.resume()
       },
       style: {
         boxSizing: 'border-box',
@@ -162,7 +194,7 @@ export function createPill(React: ReactApi) {
             letterSpacing: '0.4px',
             fontWeight: 600,
           },
-        }, labels.ram),
+        }, labels.rss),
         h('span', { key: 'value', style: { fontWeight: 600 } }, value),
         h('span', { key: 'sep', style: { color: tertiary } }, '\u00b7'),
         h('span', { key: 'pct', style: { color, fontWeight: 600 } }, percentText),

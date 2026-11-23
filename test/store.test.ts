@@ -44,9 +44,35 @@ function fetcherFor(answers: { stats?: () => FakeResponse | Promise<FakeResponse
   }) as unknown as FakeFetcher
 }
 
+interface FakeVisibility {
+  hidden: boolean
+  emit(hidden: boolean): void
+  readonly listeners: Set<(hidden: boolean) => void>
+  subscribe(listener: (hidden: boolean) => void): () => void
+}
+
+/** A visibility source the test drives, standing in for `document.visibilityState`. */
+function fakeVisibility(hidden = false): FakeVisibility {
+  const listeners = new Set<(hidden: boolean) => void>()
+  return {
+    hidden,
+    listeners,
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+    emit(next) {
+      this.hidden = next
+      for (const listener of [...listeners]) listener(next)
+    },
+  }
+}
+
 /** Store under test, with the cast kept in one place. */
-function storeWith(fetcher: FakeFetcher) {
-  return createMeterStore({ fetcher: fetcher as unknown as typeof fetch })
+function storeWith(fetcher: FakeFetcher, visibility: FakeVisibility = fakeVisibility()) {
+  return createMeterStore({ fetcher: fetcher as unknown as typeof fetch, visibility })
 }
 
 /** How many times the stats route was read. */
@@ -82,8 +108,7 @@ describe('polling store', () => {
 
     // One more tick two seconds later: the cadence comes from the configuration route.
     await vi.advanceTimersByTimeAsync(2000)
-    const statsCalls = fetcher.mock.calls.filter(call => String(call[0]) === '/dsh-ram')
-    expect(statsCalls.length).toBeGreaterThanOrEqual(2)
+    expect(statsReads(fetcher)).toBeGreaterThanOrEqual(2)
 
     store.stop()
   })
@@ -169,7 +194,7 @@ describe('polling store', () => {
 })
 
 describe('hover pause', () => {
-  it('suspends polling between pause() and resume(), then resumes with a fresh read', async () => {
+  it('suspends polling while hovered, then resumes with a fresh read', async () => {
     const fetcher = fetcherFor({ stats: () => ok(LIVE) })
     const store = storeWith(fetcher)
 
@@ -177,13 +202,13 @@ describe('hover pause', () => {
     await vi.advanceTimersByTimeAsync(2000)
     expect(statsReads(fetcher)).toBe(1)
 
-    store.pause()
+    store.pause('hover')
     // Ten intervals of hovering: no request, and the rendered value cannot change.
     await vi.advanceTimersByTimeAsync(20_000)
     expect(statsReads(fetcher)).toBe(1)
     expect(store.getSnapshot().sample).toEqual(LIVE)
 
-    store.resume()
+    store.resume('hover')
     // Resuming reads immediately so the value is fresh as soon as the pointer leaves...
     await vi.advanceTimersByTimeAsync(0)
     expect(statsReads(fetcher)).toBe(2)
@@ -195,7 +220,7 @@ describe('hover pause', () => {
     store.stop()
   })
 
-  it('drops a read that was in flight when the pointer arrived', async () => {
+  it('drops a read that was in flight when the hover began', async () => {
     let release: (value: FakeResponse) => void = () => {}
     const pending = new Promise<FakeResponse>((resolve) => {
       release = resolve
@@ -207,19 +232,19 @@ describe('hover pause', () => {
     await vi.advanceTimersByTimeAsync(2000)
     expect(store.getSnapshot().sample).toBeNull()
 
-    store.pause()
+    store.pause('hover')
     release(ok(LIVE))
     await vi.advanceTimersByTimeAsync(0)
     await Promise.resolve()
 
-    // The aborted read must not publish: no value appears under the cursor, and no false "—".
+    // The abandoned read must not publish: no value appears under the cursor, and no false "—".
     expect(store.getSnapshot().sample).toBeNull()
     expect(store.getSnapshot().unreachable).toBe(false)
 
     store.stop()
   })
 
-  it('keeps the failure state frozen while paused', async () => {
+  it('keeps the failure state frozen while hovered', async () => {
     const fetcher = fetcherFor({ stats: () => fail(503) })
     const store = storeWith(fetcher)
 
@@ -227,7 +252,7 @@ describe('hover pause', () => {
     await vi.advanceTimersByTimeAsync(2000)
     expect(store.getSnapshot().unreachable).toBe(true)
 
-    store.pause()
+    store.pause('hover')
     await vi.advanceTimersByTimeAsync(10_000)
 
     expect(store.getSnapshot().unreachable).toBe(true)
@@ -235,23 +260,114 @@ describe('hover pause', () => {
     store.stop()
   })
 
-  it('ignores a repeated pause and a resume without a pause', async () => {
+  it('ignores a repeated pause and a resume of a reason that is not held', async () => {
     const fetcher = fetcherFor({ stats: () => ok(LIVE) })
     const store = storeWith(fetcher)
 
     store.start()
     await vi.advanceTimersByTimeAsync(2000)
 
-    store.resume()
+    store.resume('hover')
     await vi.advanceTimersByTimeAsync(2000)
     expect(statsReads(fetcher)).toBe(2)
 
-    store.pause()
-    store.pause()
+    store.pause('hover')
+    store.pause('hover')
     await vi.advanceTimersByTimeAsync(10_000)
     expect(statsReads(fetcher)).toBe(2)
 
+    // One release is enough for one hold: the duplicate pause did not stack.
+    store.resume('hover')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(statsReads(fetcher)).toBe(3)
+
     store.stop()
+  })
+})
+
+describe('page visibility', () => {
+  it('sends no request while hidden and resumes within one interval', async () => {
+    const fetcher = fetcherFor({ stats: () => ok(LIVE) })
+    const visibility = fakeVisibility(false)
+    const store = storeWith(fetcher, visibility)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(statsReads(fetcher)).toBe(1)
+
+    visibility.emit(true)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(statsReads(fetcher)).toBe(1)
+
+    visibility.emit(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(statsReads(fetcher)).toBe(2)
+
+    // Back on the configured cadence.
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(statsReads(fetcher)).toBe(3)
+
+    store.stop()
+  })
+
+  it('keeps polling suspended while another reason is still held', async () => {
+    const fetcher = fetcherFor({ stats: () => ok(LIVE) })
+    const visibility = fakeVisibility(false)
+    const store = storeWith(fetcher, visibility)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(statsReads(fetcher)).toBe(1)
+
+    store.pause('hover')
+    visibility.emit(true)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(statsReads(fetcher)).toBe(1)
+
+    // Releasing hover alone must not revive the poll: the page is still hidden.
+    store.resume('hover')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(statsReads(fetcher)).toBe(1)
+
+    // Releasing the last reason does.
+    visibility.emit(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(statsReads(fetcher)).toBe(2)
+
+    store.stop()
+  })
+
+  it('arms nothing when the page starts hidden', async () => {
+    const fetcher = fetcherFor({ stats: () => ok(LIVE) })
+    const visibility = fakeVisibility(true)
+    const store = storeWith(fetcher, visibility)
+
+    store.start()
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(statsReads(fetcher)).toBe(0)
+
+    visibility.emit(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(statsReads(fetcher)).toBe(1)
+
+    store.stop()
+  })
+
+  it('removes the visibility listener in stop()', async () => {
+    const fetcher = fetcherFor({ stats: () => ok(LIVE) })
+    const visibility = fakeVisibility(false)
+    const store = storeWith(fetcher, visibility)
+
+    store.start()
+    expect(visibility.listeners.size).toBe(1)
+
+    store.stop()
+    expect(visibility.listeners.size).toBe(0)
+
+    // A late event after stop must not throw or schedule anything.
+    expect(() => visibility.emit(true)).not.toThrow()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(statsReads(fetcher)).toBe(0)
   })
 })
 
